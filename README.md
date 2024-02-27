@@ -9,6 +9,8 @@
 
 # Hickory DNS
 
+Name inspired by nursery rhyme - hickory dickory dock.
+
 A Rust based DNS client, server, and Resolver, built to be safe and secure from the
 ground up.
 
