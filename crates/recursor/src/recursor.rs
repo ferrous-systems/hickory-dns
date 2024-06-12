@@ -8,8 +8,20 @@
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use async_recursion::async_recursion;
-use futures_util::{future::select_all, FutureExt};
-use hickory_resolver::name_server::TokioConnectionProvider;
+use futures_util::{
+    future::{self, select_all},
+    stream::{self, BoxStream},
+    FutureExt as _, StreamExt, TryFutureExt as _,
+};
+use hickory_proto::{
+    error::ProtoError,
+    op::{Message, OpCode},
+    xfer::{DnsHandle, DnsRequest, DnsResponse},
+};
+use hickory_resolver::{
+    dns_lru::{DnsLru, TtlConfig},
+    name_server::TokioConnectionProvider,
+};
 use lru_cache::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
@@ -25,7 +37,6 @@ use crate::{
     recursor_pool::RecursorPool,
     resolver::{
         config::{NameServerConfig, NameServerConfigGroup, Protocol, ResolverOpts},
-        dns_lru::{DnsLru, TtlConfig},
         error::ResolveError,
         lookup::Lookup,
         name_server::{GenericNameServerPool, TokioRuntimeProvider},
@@ -101,10 +112,10 @@ impl RecursorBuilder {
 ///
 /// This is the well known root nodes, referred to as hints in RFCs. See the IANA [Root Servers](https://www.iana.org/domains/root/servers) list.
 pub struct Recursor {
-    roots: RecursorPool<TokioRuntimeProvider>,
-    name_server_cache: Mutex<NameServerCache<TokioRuntimeProvider>>,
-    record_cache: DnsLru,
-    security_aware: bool,
+    // roots: RecursorPool<TokioRuntimeProvider>,
+    // name_server_cache: Mutex<NameServerCache<TokioRuntimeProvider>>,
+    // record_cache: DnsLru,
+    // security_aware: bool,
 }
 
 impl Recursor {
@@ -129,311 +140,72 @@ impl Recursor {
         let roots =
             GenericNameServerPool::from_config(roots, opts, TokioConnectionProvider::default());
         let roots = RecursorPool::from(Name::root(), roots);
-        let name_server_cache = Mutex::new(NameServerCache::new(ns_cache_size));
+        let name_server_cache = Arc::new(Mutex::new(NameServerCache::new(ns_cache_size)));
         let record_cache = DnsLru::new(record_cache_size, TtlConfig::default());
 
-        Ok(Self {
-            roots,
+        let dns_handle = RecursiveDnsHandle {
             name_server_cache,
             record_cache,
+            roots,
             security_aware,
-        })
-    }
-
-    /// Perform a recursive resolution
-    ///
-    /// [RFC 1034](https://datatracker.ietf.org/doc/html/rfc1034#section-5.3.3), Domain Concepts and Facilities, November 1987
-    ///
-    /// ```text
-    /// 5.3.3. Algorithm
-    ///
-    /// The top level algorithm has four steps:
-    ///
-    ///    1. See if the answer is in local information, and if so return
-    ///       it to the client.
-    ///
-    ///    2. Find the best servers to ask.
-    ///
-    ///    3. Send them queries until one returns a response.
-    ///
-    ///    4. Analyze the response, either:
-    ///
-    ///          a. if the response answers the question or contains a name
-    ///             error, cache the data as well as returning it back to
-    ///             the client.
-    ///
-    ///          b. if the response contains a better delegation to other
-    ///             servers, cache the delegation information, and go to
-    ///             step 2.
-    ///
-    ///          c. if the response shows a CNAME and that is not the
-    ///             answer itself, cache the CNAME, change the SNAME to the
-    ///             canonical name in the CNAME RR and go to step 1.
-    ///
-    ///          d. if the response shows a servers failure or other
-    ///             bizarre contents, delete the server from the SLIST and
-    ///             go back to step 3.
-    ///
-    /// Step 1 searches the cache for the desired data. If the data is in the
-    /// cache, it is assumed to be good enough for normal use.  Some resolvers
-    /// have an option at the user interface which will force the resolver to
-    /// ignore the cached data and consult with an authoritative server.  This
-    /// is not recommended as the default.  If the resolver has direct access to
-    /// a name server's zones, it should check to see if the desired data is
-    /// present in authoritative form, and if so, use the authoritative data in
-    /// preference to cached data.
-    ///
-    /// Step 2 looks for a name server to ask for the required data.  The
-    /// general strategy is to look for locally-available name server RRs,
-    /// starting at SNAME, then the parent domain name of SNAME, the
-    /// grandparent, and so on toward the root.  Thus if SNAME were
-    /// Mockapetris.ISI.EDU, this step would look for NS RRs for
-    /// Mockapetris.ISI.EDU, then ISI.EDU, then EDU, and then . (the root).
-    /// These NS RRs list the names of hosts for a zone at or above SNAME.  Copy
-    /// the names into SLIST.  Set up their addresses using local data.  It may
-    /// be the case that the addresses are not available.  The resolver has many
-    /// choices here; the best is to start parallel resolver processes looking
-    /// for the addresses while continuing onward with the addresses which are
-    /// available.  Obviously, the design choices and options are complicated
-    /// and a function of the local host's capabilities.  The recommended
-    /// priorities for the resolver designer are:
-    ///
-    ///    1. Bound the amount of work (packets sent, parallel processes
-    ///       started) so that a request can't get into an infinite loop or
-    ///       start off a chain reaction of requests or queries with other
-    ///       implementations EVEN IF SOMEONE HAS INCORRECTLY CONFIGURED
-    ///       SOME DATA.
-    ///
-    ///    2. Get back an answer if at all possible.
-    ///
-    ///    3. Avoid unnecessary transmissions.
-    ///
-    ///    4. Get the answer as quickly as possible.
-    ///
-    /// If the search for NS RRs fails, then the resolver initializes SLIST from
-    /// the safety belt SBELT.  The basic idea is that when the resolver has no
-    /// idea what servers to ask, it should use information from a configuration
-    /// file that lists several servers which are expected to be helpful.
-    /// Although there are special situations, the usual choice is two of the
-    /// root servers and two of the servers for the host's domain.  The reason
-    /// for two of each is for redundancy.  The root servers will provide
-    /// eventual access to all of the domain space.  The two local servers will
-    /// allow the resolver to continue to resolve local names if the local
-    /// network becomes isolated from the internet due to gateway or link
-    /// failure.
-    ///
-    /// In addition to the names and addresses of the servers, the SLIST data
-    /// structure can be sorted to use the best servers first, and to insure
-    /// that all addresses of all servers are used in a round-robin manner.  The
-    /// sorting can be a simple function of preferring addresses on the local
-    /// network over others, or may involve statistics from past events, such as
-    /// previous response times and batting averages.
-    ///
-    /// Step 3 sends out queries until a response is received.  The strategy is
-    /// to cycle around all of the addresses for all of the servers with a
-    /// timeout between each transmission.  In practice it is important to use
-    /// all addresses of a multihomed host, and too aggressive a retransmission
-    /// policy actually slows response when used by multiple resolvers
-    /// contending for the same name server and even occasionally for a single
-    /// resolver.  SLIST typically contains data values to control the timeouts
-    /// and keep track of previous transmissions.
-    ///
-    /// Step 4 involves analyzing responses.  The resolver should be highly
-    /// paranoid in its parsing of responses.  It should also check that the
-    /// response matches the query it sent using the ID field in the response.
-    ///
-    /// The ideal answer is one from a server authoritative for the query which
-    /// either gives the required data or a name error.  The data is passed back
-    /// to the user and entered in the cache for future use if its TTL is
-    /// greater than zero.
-    ///
-    /// If the response shows a delegation, the resolver should check to see
-    /// that the delegation is "closer" to the answer than the servers in SLIST
-    /// are.  This can be done by comparing the match count in SLIST with that
-    /// computed from SNAME and the NS RRs in the delegation.  If not, the reply
-    /// is bogus and should be ignored.  If the delegation is valid the NS
-    /// delegation RRs and any address RRs for the servers should be cached.
-    /// The name servers are entered in the SLIST, and the search is restarted.
-    ///
-    /// If the response contains a CNAME, the search is restarted at the CNAME
-    /// unless the response has the data for the canonical name or if the CNAME
-    /// is the answer itself.
-    ///
-    /// Details and implementation hints can be found in [RFC-1035].
-    ///
-    /// 6. A SCENARIO
-    ///
-    /// In our sample domain space, suppose we wanted separate administrative
-    /// control for the root, MIL, EDU, MIT.EDU and ISI.EDU zones.  We might
-    /// allocate name servers as follows:
-    ///
-    ///
-    ///                                    |(C.ISI.EDU,SRI-NIC.ARPA
-    ///                                    | A.ISI.EDU)
-    ///              +---------------------+------------------+
-    ///              |                     |                  |
-    ///             MIL                   EDU                ARPA
-    ///              |(SRI-NIC.ARPA,       |(SRI-NIC.ARPA,    |
-    ///              | A.ISI.EDU           | C.ISI.EDU)       |
-    ///        +-----+-----+               |     +------+-----+-----+
-    ///        |     |     |               |     |      |           |
-    ///       BRL  NOSC  DARPA             |  IN-ADDR  SRI-NIC     ACC
-    ///                                    |
-    ///        +--------+------------------+---------------+--------+
-    ///        |        |                  |               |        |
-    ///       UCI      MIT                 |              UDEL     YALE
-    ///                 |(XX.LCS.MIT.EDU, ISI
-    ///                 |ACHILLES.MIT.EDU) |(VAXA.ISI.EDU,VENERA.ISI.EDU,
-    ///             +---+---+              | A.ISI.EDU)
-    ///             |       |              |
-    ///            LCS   ACHILLES +--+-----+-----+--------+
-    ///             |             |  |     |     |        |
-    ///             XX            A  C   VAXA  VENERA Mockapetris
-    ///
-    /// In this example, the authoritative name server is shown in parentheses
-    /// at the point in the domain tree at which is assumes control.
-    ///
-    /// Thus the root name servers are on C.ISI.EDU, SRI-NIC.ARPA, and
-    /// A.ISI.EDU.  The MIL domain is served by SRI-NIC.ARPA and A.ISI.EDU.  The
-    /// EDU domain is served by SRI-NIC.ARPA. and C.ISI.EDU.  Note that servers
-    /// may have zones which are contiguous or disjoint.  In this scenario,
-    /// C.ISI.EDU has contiguous zones at the root and EDU domains.  A.ISI.EDU
-    /// has contiguous zones at the root and MIL domains, but also has a non-
-    /// contiguous zone at ISI.EDU.
-    /// ```
-    pub async fn resolve(
-        &self,
-        query: Query,
-        request_time: Instant,
-        query_has_dnssec_ok: bool,
-    ) -> Result<Lookup, Error> {
-        if self.security_aware {
-            // TODO RFC4035 section 4.5 recommends caching "each response as a single atomic entry
-            // containing the entire answer, including the named RRset and any associated DNSSEC
-            // RRs"
-        } else if let Some(lookup) = self.record_cache.get(&query, request_time) {
-            return lookup.map_err(Into::into);
-        }
-
-        // not in cache, let's look for an ns record for lookup
-        let zone = match query.query_type() {
-            // (RFC4035 section 3.1.4.1) the DS record needs to be queried in the parent zone
-            RecordType::NS | RecordType::DS => query.name().base_name(),
-            // look for the NS records "inside" the zone
-            _ => query.name().clone(),
         };
 
-        let mut zone = zone;
-        let mut ns = None;
+        todo!()
+        // Ok(Self {
+        //     roots,
+        //     name_server_cache,
+        //     security_aware,
+        // })
+    }
+}
 
-        // max number of forwarding processes
-        'max_forward: for _ in 0..20 {
-            match self.ns_pool_for_zone(zone.clone(), request_time).await {
-                Ok(found) => {
-                    // found the nameserver
-                    ns = Some(found);
-                    break 'max_forward;
-                }
-                Err(e) => match e.kind() {
-                    ErrorKind::Forward(name) => {
-                        // if we already had this name, don't try again
-                        if &zone == name {
-                            debug!("zone previously searched for {}", name);
-                            break 'max_forward;
-                        };
+/// Non-validating recursive resolver
+#[derive(Clone)]
+struct RecursiveDnsHandle {
+    name_server_cache: Arc<Mutex<NameServerCache<TokioRuntimeProvider>>>,
+    record_cache: DnsLru,
+    roots: RecursorPool<TokioRuntimeProvider>,
+    // whether the DO (DNSSEC OK) bit is set in outgoing queries or not
+    security_aware: bool,
+}
 
-                        debug!("ns forwarded to {}", name);
-                        zone = name.clone();
-                    }
-                    _ => return Err(e),
-                },
-            }
-        }
+impl DnsHandle for RecursiveDnsHandle {
+    type Response = BoxStream<'static, Result<DnsResponse, ProtoError>>;
 
-        let ns = ns.ok_or_else(|| Error::from(format!("no nameserver found for {zone}")))?;
-        debug!("found zone {} for {}", ns.zone(), query);
+    fn send<R: Into<DnsRequest> + Unpin + Send + 'static>(&self, request: R) -> Self::Response {
+        let request = request.into();
 
-        let dnssec = if self.security_aware {
-            Dnssec::Aware {
-                query_has_dnssec_ok,
+        let query = if let OpCode::Query = request.op_code() {
+            if let Some(query) = request.queries().first().cloned() {
+                query
+            } else {
+                return Box::pin(stream::once(future::err(ProtoError::from(
+                    "no query in request",
+                ))));
             }
         } else {
-            Dnssec::Unaware
+            return Box::pin(stream::once(future::err(ProtoError::from(
+                "request is not a query",
+            ))));
         };
-        let response = self.lookup(query, ns, request_time, dnssec).await?;
-        Ok(response)
+
+        let this = self.clone();
+        stream::once(async move {
+            this.resolve(query, Instant::now())
+                .map_ok(|lookup| {
+                    // TODO
+                    let mut msg = Message::new();
+                    msg.add_answers(lookup.records().iter().cloned());
+                    DnsResponse::new(msg, vec![])
+                })
+                .map_err(|e| ProtoError::from(e.to_string()))
+                .await
+        })
+        .boxed()
     }
+}
 
-    async fn lookup(
-        &self,
-        query: Query,
-        ns: RecursorPool<TokioRuntimeProvider>,
-        now: Instant,
-        dnssec: Dnssec,
-    ) -> Result<Lookup, Error> {
-        if !dnssec.is_security_aware() {
-            if let Some(lookup) = self.record_cache.get(&query, now) {
-                debug!("cached data {lookup:?}");
-                return lookup.map_err(Into::into);
-            }
-        }
-
-        let response = ns.lookup(query.clone(), self.security_aware);
-
-        // TODO: we are only expecting one response
-        // TODO: should we change DnsHandle to always be a single response? And build a totally custom handler for other situations?
-        // TODO: check if data is "authentic"
-        match response.await {
-            Ok(r) => {
-                let mut r = r.into_message();
-                info!("response: {}", r.header());
-
-                if let Dnssec::Aware {
-                    query_has_dnssec_ok,
-                } = dnssec
-                {
-                    // TODO: validation must be performed if the CD (Checking Disabled) is not set
-                    let mut answers = r.take_answers();
-                    if !query_has_dnssec_ok {
-                        answers.retain(|rrset| {
-                            // RFC 4035 section 3.2.1 if DO bit not set, strip DNSSEC records
-                            // unless explicitly requested
-                            let record_type = rrset.record_type();
-                            record_type == query.query_type() || !record_type.is_dnssec()
-                        });
-                    }
-
-                    Ok(Lookup::new_with_max_ttl(query, Arc::from(answers)))
-                } else {
-                    let records = r
-                        .take_answers()
-                        .into_iter()
-                        .chain(r.take_name_servers())
-                        .chain(r.take_additionals())
-                        .filter(|x| {
-                            if !is_subzone(ns.zone().clone(), x.name().clone()) {
-                                warn!(
-                                    "Dropping out of bailiwick record {x} for zone {}",
-                                    ns.zone().clone()
-                                );
-                                false
-                            } else {
-                                true
-                            }
-                        });
-
-                    let lookup = self.record_cache.insert_records(query, records, now);
-
-                    lookup.ok_or_else(|| Error::from("no records found"))
-                }
-            }
-            Err(e) => {
-                warn!("lookup error: {e}");
-                Err(Error::from(e))
-            }
-        }
-    }
-
+impl RecursiveDnsHandle {
     #[async_recursion]
     async fn ns_pool_for_zone(
         &self,
@@ -458,12 +230,7 @@ impl Recursor {
 
         let lookup = Query::query(zone.clone(), RecordType::NS);
         let response = self
-            .lookup(
-                lookup.clone(),
-                nameserver_pool.clone(),
-                request_time,
-                Dnssec::Unaware,
-            )
+            .lookup(lookup.clone(), nameserver_pool.clone(), request_time)
             .await?;
 
         // let zone_nameservers = response.name_servers();
@@ -536,12 +303,12 @@ impl Recursor {
             debug!("need glue for {}", zone);
             let a_resolves = need_ips_for_names.iter().take(1).map(|name| {
                 let a_query = Query::query(name.0.clone(), RecordType::A);
-                self.resolve(a_query, request_time, false).boxed()
+                self.resolve(a_query, request_time).boxed()
             });
 
             let aaaa_resolves = need_ips_for_names.iter().take(1).map(|name| {
                 let aaaa_query = Query::query(name.0.clone(), RecordType::AAAA);
-                self.resolve(aaaa_query, request_time, false).boxed()
+                self.resolve(aaaa_query, request_time).boxed()
             });
 
             let mut a_resolves: Vec<_> = a_resolves.chain(aaaa_resolves).collect();
@@ -584,17 +351,101 @@ impl Recursor {
         self.name_server_cache.lock().insert(zone, ns.clone());
         Ok(ns)
     }
-}
 
-enum Dnssec {
-    Unaware,
-    Aware { query_has_dnssec_ok: bool },
-}
+    async fn resolve(&self, query: Query, request_time: Instant) -> Result<Lookup, Error> {
+        if let Some(lookup) = self.record_cache.get(&query, request_time) {
+            return lookup.map_err(Into::into);
+        }
 
-impl Dnssec {
-    #[must_use]
-    fn is_security_aware(&self) -> bool {
-        matches!(self, Self::Aware { .. })
+        // not in cache, let's look for an ns record for lookup
+        let zone = match query.query_type() {
+            // (RFC4035 section 3.1.4.1) the DS record needs to be queried in the parent zone
+            RecordType::NS | RecordType::DS => query.name().base_name(),
+            // look for the NS records "inside" the zone
+            _ => query.name().clone(),
+        };
+
+        let mut zone = zone;
+        let mut ns = None;
+
+        // max number of forwarding processes
+        'max_forward: for _ in 0..20 {
+            match self.ns_pool_for_zone(zone.clone(), request_time).await {
+                Ok(found) => {
+                    // found the nameserver
+                    ns = Some(found);
+                    break 'max_forward;
+                }
+                Err(e) => match e.kind() {
+                    ErrorKind::Forward(name) => {
+                        // if we already had this name, don't try again
+                        if &zone == name {
+                            debug!("zone previously searched for {}", name);
+                            break 'max_forward;
+                        };
+
+                        debug!("ns forwarded to {}", name);
+                        zone = name.clone();
+                    }
+                    _ => return Err(e),
+                },
+            }
+        }
+
+        let ns = ns.ok_or_else(|| Error::from(format!("no nameserver found for {zone}")))?;
+        debug!("found zone {} for {}", ns.zone(), query);
+
+        let response = self.lookup(query, ns, request_time).await?;
+        Ok(response)
+    }
+
+    async fn lookup(
+        &self,
+        query: Query,
+        ns: RecursorPool<TokioRuntimeProvider>,
+        now: Instant,
+    ) -> Result<Lookup, Error> {
+        if let Some(lookup) = self.record_cache.get(&query, now) {
+            debug!("cached data {lookup:?}");
+            return lookup.map_err(Into::into);
+        }
+
+        let response = ns.lookup(query.clone(), self.security_aware);
+
+        // TODO: we are only expecting one response
+        // TODO: should we change DnsHandle to always be a single response? And build a totally custom handler for other situations?
+        // TODO: check if data is "authentic"
+        match response.await {
+            Ok(r) => {
+                let mut r = r.into_message();
+                info!("response: {}", r.header());
+
+                let records = r
+                    .take_answers()
+                    .into_iter()
+                    .chain(r.take_name_servers())
+                    .chain(r.take_additionals())
+                    .filter(|x| {
+                        if !is_subzone(ns.zone().clone(), x.name().clone()) {
+                            warn!(
+                                "Dropping out of bailiwick record {x} for zone {}",
+                                ns.zone().clone()
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    });
+
+                let lookup = self.record_cache.insert_records(query, records, now);
+
+                lookup.ok_or_else(|| Error::from("no records found"))
+            }
+            Err(e) => {
+                warn!("lookup error: {e}");
+                Err(Error::from(e))
+            }
+        }
     }
 }
 
