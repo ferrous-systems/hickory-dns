@@ -13,6 +13,8 @@ use futures_util::{
     stream::{self, BoxStream},
     FutureExt as _, StreamExt, TryFutureExt as _,
 };
+#[cfg(feature = "dnssec")]
+use hickory_proto::xfer::DnssecDnsHandle;
 use hickory_proto::{
     error::ProtoError,
     op::{Message, OpCode},
@@ -112,10 +114,7 @@ impl RecursorBuilder {
 ///
 /// This is the well known root nodes, referred to as hints in RFCs. See the IANA [Root Servers](https://www.iana.org/domains/root/servers) list.
 pub struct Recursor {
-    // roots: RecursorPool<TokioRuntimeProvider>,
-    // name_server_cache: Mutex<NameServerCache<TokioRuntimeProvider>>,
-    // record_cache: DnsLru,
-    // security_aware: bool,
+    either: RecursorEither,
 }
 
 impl Recursor {
@@ -150,13 +149,32 @@ impl Recursor {
             security_aware,
         };
 
-        todo!()
-        // Ok(Self {
-        //     roots,
-        //     name_server_cache,
-        //     security_aware,
-        // })
+        Ok(Self {
+            either: RecursorEither::NonValidating(dns_handle),
+        })
     }
+
+    pub async fn resolve(
+        &self,
+        query: Query,
+        request_time: Instant,
+        query_has_dnssec_ok: bool,
+    ) -> Result<Lookup, Error> {
+        match &self.either {
+            RecursorEither::NonValidating(handle) => {
+                let lookup = handle.resolve(query, request_time).await;
+                panic!("{lookup:#?}")
+            }
+            #[cfg(feature = "dnssec")]
+            RecursorEither::Validating(_) => todo!(),
+        }
+    }
+}
+
+enum RecursorEither {
+    NonValidating(RecursiveDnsHandle),
+    #[cfg(feature = "dnssec")]
+    Validating(DnssecDnsHandle<RecursiveDnsHandle>),
 }
 
 /// Non-validating recursive resolver
@@ -193,7 +211,10 @@ impl DnsHandle for RecursiveDnsHandle {
         stream::once(async move {
             this.resolve(query, Instant::now())
                 .map_ok(|lookup| {
-                    // TODO
+                    // HACK `DnssecDnsHandle` will only look at the answer section of the message so
+                    // we can put "stubs" in the other fields
+                    // XXX this effectively merges the original nameservers and additionals sections
+                    // into the answers section
                     let mut msg = Message::new();
                     msg.add_answers(lookup.records().iter().cloned());
                     DnsResponse::new(msg, vec![])
@@ -405,6 +426,8 @@ impl RecursiveDnsHandle {
         ns: RecursorPool<TokioRuntimeProvider>,
         now: Instant,
     ) -> Result<Lookup, Error> {
+        debug!("lookup: {query} - {}", ns.zone());
+
         if let Some(lookup) = self.record_cache.get(&query, now) {
             debug!("cached data {lookup:?}");
             return lookup.map_err(Into::into);
@@ -426,7 +449,7 @@ impl RecursiveDnsHandle {
                     .chain(r.take_name_servers())
                     .chain(r.take_additionals())
                     .filter(|x| {
-                        if !is_subzone(ns.zone().clone(), x.name().clone()) {
+                        if !is_subzone(dbg!(ns.zone()).clone(), dbg!(x.name()).clone()) {
                             warn!(
                                 "Dropping out of bailiwick record {x} for zone {}",
                                 ns.zone().clone()
