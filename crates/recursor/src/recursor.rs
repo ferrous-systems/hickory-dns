@@ -14,11 +14,11 @@ use futures_util::{
     FutureExt as _, StreamExt, TryFutureExt as _,
 };
 #[cfg(feature = "dnssec")]
-use hickory_proto::xfer::DnssecDnsHandle;
+use hickory_proto::xfer::{DnssecDnsHandle, FirstAnswer};
 use hickory_proto::{
     error::ProtoError,
     op::{Message, OpCode},
-    xfer::{DnsHandle, DnsRequest, DnsResponse},
+    xfer::{DnsHandle, DnsRequest, DnsRequestOptions, DnsResponse},
 };
 use hickory_resolver::{
     dns_lru::{DnsLru, TtlConfig},
@@ -57,6 +57,8 @@ pub struct RecursorBuilder {
     record_cache_size: usize,
     #[cfg(feature = "dnssec")]
     security_aware: bool,
+    #[cfg(feature = "dnssec")]
+    validate: bool,
 }
 
 impl Default for RecursorBuilder {
@@ -66,6 +68,8 @@ impl Default for RecursorBuilder {
             record_cache_size: 1048576,
             #[cfg(feature = "dnssec")]
             security_aware: false,
+            #[cfg(feature = "dnssec")]
+            validate: false,
         }
     }
 }
@@ -90,6 +94,13 @@ impl RecursorBuilder {
         self
     }
 
+    /// Enables or disables validation of DNSSEC records
+    #[cfg(feature = "dnssec")]
+    pub fn validate(&mut self, validate: bool) -> &mut Self {
+        self.validate = validate;
+        self
+    }
+
     /// Construct a new recursor using the list of NameServerConfigs for the root node list
     ///
     /// # Panics
@@ -97,15 +108,16 @@ impl RecursorBuilder {
     /// This will panic if the roots are empty.
     pub fn build(&self, roots: impl Into<NameServerConfigGroup>) -> Result<Recursor, ResolveError> {
         #[cfg(not(feature = "dnssec"))]
-        let security_aware = false;
+        let (security_aware, validate) = (false, false);
         #[cfg(feature = "dnssec")]
-        let security_aware = self.security_aware;
+        let (security_aware, validate) = (self.security_aware, self.validate);
 
         Recursor::build(
             roots,
             self.ns_cache_size,
             self.record_cache_size,
             security_aware,
+            validate,
         )
     }
 }
@@ -128,6 +140,7 @@ impl Recursor {
         ns_cache_size: usize,
         record_cache_size: usize,
         security_aware: bool,
+        validate: bool,
     ) -> Result<Self, ResolveError> {
         // configure the hickory-resolver
         let roots: NameServerConfigGroup = roots.into();
@@ -146,12 +159,25 @@ impl Recursor {
             name_server_cache,
             record_cache,
             roots,
-            security_aware,
+            // to validate, the recursor must be security aware
+            security_aware: security_aware | validate,
         };
 
-        Ok(Self {
-            either: RecursorEither::NonValidating(dns_handle),
-        })
+        #[cfg(feature = "dnssec")]
+        let either = if validate {
+            let record_cache = dns_handle.record_cache.clone();
+            let dns_handle = DnssecDnsHandle::new(dns_handle);
+            RecursorEither::Validating {
+                handle: dns_handle,
+                record_cache,
+            }
+        } else {
+            RecursorEither::NonValidating(dns_handle)
+        };
+        #[cfg(not(feature = "dnssec"))]
+        let either = RecursorEither::NonValidating(dns_handle);
+
+        Ok(Self { either })
     }
 
     pub async fn resolve(
@@ -160,37 +186,61 @@ impl Recursor {
         request_time: Instant,
         query_has_dnssec_ok: bool,
     ) -> Result<Lookup, Error> {
-        match &self.either {
+        let mut lookup = match &self.either {
             RecursorEither::NonValidating(handle) => {
-                let mut lookup = handle.resolve(query.clone(), request_time).await?;
-
-                if !query_has_dnssec_ok {
-                    // RFC 4035 section 3.2.1 if DO bit not set, strip DNSSEC records unless explicitly requested
-                    let records = lookup
-                        .records()
-                        .iter()
-                        .filter(|rr| {
-                            let record_type = rr.record_type();
-                            record_type == query.query_type() || !record_type.is_dnssec()
-                        })
-                        .cloned()
-                        .collect();
-
-                    lookup = Lookup::new_with_deadline(query, records, lookup.valid_until());
-                }
-
-                Ok(lookup)
+                handle.resolve(query.clone(), request_time).await?
             }
+
             #[cfg(feature = "dnssec")]
-            RecursorEither::Validating(_) => todo!(),
+            RecursorEither::Validating {
+                handle,
+                record_cache,
+            } => {
+                let mut options = DnsRequestOptions::default();
+                options.use_edns = true;
+                options.edns_set_dnssec_ok = true;
+                // FIXME copy-paste of RecursiveDnsHandle::lookup
+                let response = handle.lookup(query.clone(), options).first_answer().await?;
+                let mut message = response.into_message();
+
+                let records = message
+                    .take_answers()
+                    .into_iter()
+                    .chain(message.take_name_servers())
+                    .chain(message.take_additionals());
+
+                // insert records to update Proof field
+                let lookup = record_cache.insert_records(query.clone(), records, request_time);
+                lookup.ok_or_else(|| Error::from("no records found"))?
+            }
+        };
+
+        if !query_has_dnssec_ok {
+            // RFC 4035 section 3.2.1 if DO bit not set, strip DNSSEC records unless explicitly requested
+            let records = lookup
+                .records()
+                .iter()
+                .filter(|rr| {
+                    let record_type = rr.record_type();
+                    record_type == query.query_type() || !record_type.is_dnssec()
+                })
+                .cloned()
+                .collect();
+
+            lookup = Lookup::new_with_deadline(query, records, lookup.valid_until());
         }
+
+        Ok(lookup)
     }
 }
 
 enum RecursorEither {
     NonValidating(RecursiveDnsHandle),
     #[cfg(feature = "dnssec")]
-    Validating(DnssecDnsHandle<RecursiveDnsHandle>),
+    Validating {
+        handle: DnssecDnsHandle<RecursiveDnsHandle>,
+        record_cache: DnsLru,
+    },
 }
 
 /// Non-validating recursive resolver
