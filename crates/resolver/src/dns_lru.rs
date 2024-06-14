@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hickory_proto::error::{ProtoError, ProtoErrorKind};
+use hickory_proto::rr::dnssec::rdata::RRSIG;
+use hickory_proto::rr::RecordData;
 use lru_cache::LruCache;
 use parking_lot::Mutex;
 
@@ -242,7 +244,14 @@ impl DnsLru {
         let records = records.fold(
             HashMap::<Query, Vec<(Record, u32)>>::new(),
             |mut map, record| {
-                let mut query = Query::query(record.name().clone(), record.record_type());
+                // keep RRSIGs next to the records they cover in the cache
+                let record_type = if let Some(rrsig) = RRSIG::try_borrow(record.data()) {
+                    rrsig.type_covered()
+                } else {
+                    record.record_type()
+                };
+
+                let mut query = Query::query(record.name().clone(), record_type);
                 query.set_query_class(record.dns_class());
 
                 let ttl = record.ttl();

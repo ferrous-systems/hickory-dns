@@ -162,8 +162,24 @@ impl Recursor {
     ) -> Result<Lookup, Error> {
         match &self.either {
             RecursorEither::NonValidating(handle) => {
-                let lookup = handle.resolve(query, request_time).await;
-                panic!("{lookup:#?}")
+                let mut lookup = handle.resolve(query.clone(), request_time).await?;
+
+                if !query_has_dnssec_ok {
+                    // RFC 4035 section 3.2.1 if DO bit not set, strip DNSSEC records unless explicitly requested
+                    let records = lookup
+                        .records()
+                        .iter()
+                        .filter(|rr| {
+                            let record_type = rr.record_type();
+                            record_type == query.query_type() || !record_type.is_dnssec()
+                        })
+                        .cloned()
+                        .collect();
+
+                    lookup = Lookup::new_with_deadline(query, records, lookup.valid_until());
+                }
+
+                Ok(lookup)
             }
             #[cfg(feature = "dnssec")]
             RecursorEither::Validating(_) => todo!(),
@@ -449,7 +465,7 @@ impl RecursiveDnsHandle {
                     .chain(r.take_name_servers())
                     .chain(r.take_additionals())
                     .filter(|x| {
-                        if !is_subzone(dbg!(ns.zone()).clone(), dbg!(x.name()).clone()) {
+                        if !is_subzone(ns.zone().clone(), x.name().clone()) {
                             warn!(
                                 "Dropping out of bailiwick record {x} for zone {}",
                                 ns.zone().clone()
