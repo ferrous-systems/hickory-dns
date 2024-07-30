@@ -172,6 +172,12 @@ pub trait Authority: Send + Sync {
         lookup_options: LookupOptions,
     ) -> Result<Self::Lookup, LookupError>;
 
+    async fn get_nsec3_records(
+        &self,
+        name: &LowerName,
+        lookup_options: LookupOptions,
+    ) -> Result<Self::Lookup, LookupError>;
+
     /// Returns the SOA of the authority.
     ///
     /// *Note*: This will only return the SOA, if this is fulfilling a request, a standard lookup

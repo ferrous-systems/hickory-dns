@@ -98,6 +98,12 @@ pub trait AuthorityObject: Send + Sync {
         lookup_options: LookupOptions,
     ) -> Result<Box<dyn LookupObject>, LookupError>;
 
+    async fn get_nsec3_records(
+        &self,
+        name: &LowerName,
+        lookup_options: LookupOptions,
+    ) -> Result<Box<dyn LookupObject>, LookupError>;
+
     /// Returns the SOA of the authority.
     ///
     /// *Note*: This will only return the SOA, if this is fulfilling a request, a standard lookup
@@ -213,6 +219,16 @@ where
     ) -> Result<Box<dyn LookupObject>, LookupError> {
         let lookup = Authority::get_nsec_records(self.as_ref(), name, lookup_options).await;
         lookup.map(|l| Box::new(l) as Box<dyn LookupObject>)
+    }
+
+    async fn get_nsec3_records(
+        &self,
+        name: &LowerName,
+        lookup_options: LookupOptions,
+    ) -> Result<Box<dyn LookupObject>, LookupError> {
+        let lookup = Authority::get_nsec3_records(self.as_ref(), name, lookup_options).await;
+        lookup.map(|l| Box::new(l) as Box<dyn LookupObject>)
+
     }
 }
 
